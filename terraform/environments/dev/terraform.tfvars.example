@@ -1,0 +1,12 @@
+# Environment Configuration
+environment_prefix = "dev"
+workload          = "Terraform"
+location          = "eastus"
+data_location     = ""  # Defaults to location if not specified
+
+# Tags
+tags = {
+  Project     = "Terraform Sample"
+  Owner       = "Platform Team"
+  CostCenter  = "Engineering"
+}
