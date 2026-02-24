@@ -156,6 +156,154 @@ output "name" { value = azurerm_<resource>.main.name }
 # Additional resource-specific outputs
 ```
 
+## 🔄 CI/CD Pipeline Setup
+
+Both the GitHub Actions workflow (`.github/workflows/main.yml`) and the Azure DevOps pipeline (`.ado/pipelines/main.yml`) share the same general flow:
+
+- **CI**: Runs `fmt`, `init`, `validate`, and `plan` on pull requests targeting `main`, then posts results as a PR comment
+- **CD**: Triggered manually on `main`; runs `plan`, waits for approval, then runs `apply`
+
+### Azure Prerequisites (Required for Both)
+
+Complete these steps once regardless of which CI/CD platform you use.
+
+#### 1. Create a Service Principal
+
+```bash
+az ad sp create-for-rbac \
+  --name "sp-terraform-cicd" \
+  --role Contributor \
+  --scopes /subscriptions/<your-subscription-id> \
+  --sdk-auth
+```
+
+Save the output — you will need `clientId`, `clientSecret`, `subscriptionId`, and `tenantId`.
+
+#### 2. Create a Storage Account for Terraform State
+
+```bash
+# Create a resource group for state storage
+az group create \
+  --name rg-terraform-state \
+  --location eastus
+
+# Create the storage account (name must be globally unique)
+az storage account create \
+  --name <your-storage-account-name> \
+  --resource-group rg-terraform-state \
+  --sku Standard_LRS \
+  --allow-blob-public-access false
+
+# Create the state container
+az storage container create \
+  --name tfstate \
+  --account-name <your-storage-account-name>
+```
+
+#### 3. Grant the Service Principal Access to the State Storage Account
+
+```bash
+SP_OBJECT_ID=$(az ad sp show --id <clientId> --query id -o tsv)
+
+az role assignment create \
+  --assignee-object-id $SP_OBJECT_ID \
+  --role "Storage Blob Data Contributor" \
+  --scope /subscriptions/<subscription-id>/resourceGroups/rg-terraform-state/providers/Microsoft.Storage/storageAccounts/<your-storage-account-name>
+```
+
+#### Required Secret Values
+
+| Secret Name | Description |
+|---|---|
+| `ARM_CLIENT_ID` | Service principal client ID |
+| `ARM_CLIENT_SECRET` | Service principal client secret |
+| `ARM_SUBSCRIPTION_ID` | Azure subscription ID |
+| `ARM_TENANT_ID` | Azure tenant ID |
+| `TF_STATE_STORAGE_ACCOUNT` | Storage account name for Terraform state |
+| `TF_STATE_RESOURCE_GROUP` | Resource group containing the state storage account |
+| `DEV_LOCATION` | Azure region for the dev environment (e.g. `eastus`) |
+
+---
+
+### GitHub Actions Setup
+
+#### 1. Add Repository Secrets
+
+In your GitHub repository, go to **Settings → Secrets and variables → Actions → New repository secret** and add each value from the [Required Secret Values](#required-secret-values) table above.
+
+#### 2. Verify the Workflow File
+
+Ensure `.github/workflows/main.yml` exists in the repository. The workflow will activate automatically on the next pull request or push to `main`.
+
+#### 3. Pipeline Behavior
+
+| Trigger | Behavior |
+|---|---|
+| Pull request targeting `main` | Runs CI: fmt check, init, validate, plan; posts results as a PR comment |
+| Manual (`workflow_dispatch`) with stage `Dev` on `main` | Runs CD: init, plan, apply to dev environment |
+
+> The `dev` GitHub Environment can be configured under **Settings → Environments** to add required reviewers or wait timers before the deploy job runs.
+
+---
+
+### Azure DevOps Setup
+
+#### 1. Install the Terraform Extension
+
+Install the **Terraform** extension from the marketplace into your ADO organization. This provides the `TerraformInstaller@1` task used in the pipeline.
+
+[ms-devlabs.custom-terraform-tasks](https://marketplace.visualstudio.com/items?itemName=ms-devlabs.custom-terraform-tasks)
+
+#### 2. Create a Variable Group
+
+In **Pipelines → Library → + Variable group**, create a group named `terraform-secrets` and add each value from the [Required Secret Values](#required-secret-values) table above. Mark sensitive values as secret.
+
+#### 3. Create the Dev Environment
+
+In **Pipelines → Environments → New environment**, create an environment named `dev`. To enforce manual approval before `apply`:
+
+1. Open the `dev` environment
+2. Select **Approvals and checks → +**
+3. Add an **Approvals** check and specify the required approvers
+
+> The `ManualValidation` task in the pipeline also adds an inline approval gate before the apply job runs, acting as a second confirmation prompt.
+
+#### 4. Enable the Pipeline to Post PR Comments
+
+The CI stage uses `System.AccessToken` to call the ADO REST API and post plan output as a PR comment. To enable this:
+
+1. Edit the pipeline
+2. Select **...** (more options) → **Triggers**
+3. Under **YAML** → **Get sources**, check **Allow scripts to access the OAuth token**
+
+Alternatively, add the following to the pipeline job:
+
+```yaml
+- job: TerraformPlan
+  ...
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+```
+
+This is already included in the pipeline definition.
+
+#### 5. Create the Pipeline
+
+1. In **Pipelines → New pipeline**, select your repository source
+2. Choose **Existing Azure Pipelines YAML file**
+3. Set the path to `.ado/pipelines/main.yml`
+4. Link the `terraform-secrets` variable group under **Variables → Variable groups**
+5. Save and run
+
+#### 6. Pipeline Behavior
+
+| Trigger | Behavior |
+|---|---|
+| Pull request targeting `main` | Runs CI stage: fmt check, init, validate, plan; posts results as a PR thread comment |
+| Manual run with stage `Dev` on `main` | Runs CD stage: plan → manual approval → apply to dev environment |
+
+---
+
 ## 🧹 Cleanup
 
 To destroy all resources:

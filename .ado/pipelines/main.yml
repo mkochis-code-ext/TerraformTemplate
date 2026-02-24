@@ -1,0 +1,248 @@
+name: Terraform CI/CD
+
+parameters:
+  - name: stage
+    displayName: 'Stage'
+    type: string
+    default: 'Dev'
+    values:
+      - Dev
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+      - .ado/pipelines/main.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/**
+      - .ado/pipelines/main.yml
+
+variables:
+  TF_VERSION: '1.6.0'
+
+stages:
+  # CI - Run on Pull Requests
+  - stage: CI_TerraformPlanDev
+    displayName: 'CI - Terraform Plan (Dev)'
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    jobs:
+      - job: TerraformPlan
+        displayName: 'Terraform Plan (Dev)'
+        pool:
+          vmImage: ubuntu-latest
+        variables:
+          TF_VAR_location: $(DEV_LOCATION)
+          ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+          ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+          ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+          ARM_TENANT_ID: $(ARM_TENANT_ID)
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: 'Setup Terraform'
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              cat > backend.tf <<EOF
+              terraform {
+                backend "azurerm" {
+                  storage_account_name = "$(TF_STATE_STORAGE_ACCOUNT)"
+                  container_name       = "tfstate"
+                  key                  = "dev.terraform.tfstate"
+                  resource_group_name  = "$(TF_STATE_RESOURCE_GROUP)"
+                  use_azuread_auth     = true
+                }
+              }
+              EOF
+            displayName: 'Setup Backend Config'
+            workingDirectory: terraform/environments/dev
+
+          - script: terraform fmt -check -recursive
+            displayName: 'Terraform Format Check'
+            workingDirectory: terraform/environments/dev
+            continueOnError: true
+            name: fmt
+
+          - script: terraform init
+            displayName: 'Terraform Init'
+            workingDirectory: terraform/environments/dev
+            name: init
+
+          - script: terraform validate
+            displayName: 'Terraform Validate'
+            workingDirectory: terraform/environments/dev
+            name: validate
+
+          - script: |
+              terraform plan -no-color -input=false 2>&1 | tee $(Agent.TempDirectory)/plan_output.txt
+              echo "##vso[task.setvariable variable=planExitCode]${PIPESTATUS[0]}"
+            displayName: 'Terraform Plan'
+            workingDirectory: terraform/environments/dev
+            continueOnError: true
+            name: plan
+
+          - script: |
+              PLAN_OUTPUT=$(cat $(Agent.TempDirectory)/plan_output.txt)
+              FMT_OUTCOME=$([ "$(fmt.result)" = "Succeeded" ] && echo "success" || echo "failure")
+              INIT_OUTCOME=$([ "$(init.result)" = "Succeeded" ] && echo "success" || echo "failure")
+              VALIDATE_OUTCOME=$([ "$(validate.result)" = "Succeeded" ] && echo "success" || echo "failure")
+              PLAN_OUTCOME=$([ "$(plan.result)" = "Succeeded" ] && echo "success" || echo "failure")
+
+              BODY=$(cat <<COMMENT
+              #### Terraform Format and Style \`${FMT_OUTCOME}\`
+              #### Terraform Initialization \`${INIT_OUTCOME}\`
+              #### Terraform Validation \`${VALIDATE_OUTCOME}\`
+              #### Terraform Plan \`${PLAN_OUTCOME}\`
+
+              <details><summary>Show Plan</summary>
+
+              \`\`\`terraform
+              ${PLAN_OUTPUT}
+              \`\`\`
+
+              </details>
+
+              *Queued by: $(Build.RequestedFor), Trigger: $(Build.Reason)*
+              COMMENT
+              )
+
+              curl -s -u ":$(System.AccessToken)" \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg body "$BODY" '{comments: [{parentCommentId: 0, content: $body, commentType: 1}], status: 1}')" \
+                "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.ID)/pullRequests/$(System.PullRequest.PullRequestId)/threads?api-version=7.1"
+            displayName: 'Comment PR with Plan'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+          - script: |
+              if [ "$(planExitCode)" != "0" ]; then
+                echo "Terraform Plan failed. Exiting."
+                exit 1
+              fi
+            displayName: 'Terraform Plan Status Check'
+
+  # CD - Deploy to Dev
+  - stage: CD_TerraformDeployDev
+    displayName: 'CD - Deploy to Dev'
+    condition: |
+      and(
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        eq(variables['Build.Reason'], 'Manual'),
+        eq('${{ parameters.stage }}', 'Dev')
+      )
+    jobs:
+      - job: TerraformPlan
+        displayName: 'Terraform Plan (Dev)'
+        pool:
+          vmImage: ubuntu-latest
+        variables:
+          TF_VAR_location: $(DEV_LOCATION)
+          ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+          ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+          ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+          ARM_TENANT_ID: $(ARM_TENANT_ID)
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: 'Setup Terraform'
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - script: |
+              cat > backend.tf <<EOF
+              terraform {
+                backend "azurerm" {
+                  storage_account_name = "$(TF_STATE_STORAGE_ACCOUNT)"
+                  container_name       = "tfstate"
+                  key                  = "dev.terraform.tfstate"
+                  resource_group_name  = "$(TF_STATE_RESOURCE_GROUP)"
+                  use_azuread_auth     = true
+                }
+              }
+              EOF
+            displayName: 'Setup Backend Config'
+            workingDirectory: terraform/environments/dev
+
+          - script: terraform init
+            displayName: 'Terraform Init'
+            workingDirectory: terraform/environments/dev
+
+          - script: terraform plan -input=false
+            displayName: 'Terraform Plan'
+            workingDirectory: terraform/environments/dev
+
+      - job: WaitForApproval
+        displayName: 'Wait for Approval'
+        dependsOn: TerraformPlan
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            displayName: 'Approve Terraform Apply'
+            inputs:
+              notifyUsers: ''
+              instructions: 'Review the Terraform Plan output above and approve to proceed with Apply to Dev.'
+              onTimeout: reject
+
+      - deployment: TerraformApply
+        displayName: 'Terraform Apply (Dev)'
+        dependsOn: WaitForApproval
+        pool:
+          vmImage: ubuntu-latest
+        environment: dev
+        variables:
+          TF_VAR_location: $(DEV_LOCATION)
+          ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+          ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+          ARM_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+          ARM_TENANT_ID: $(ARM_TENANT_ID)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  displayName: 'Setup Terraform'
+                  inputs:
+                    terraformVersion: $(TF_VERSION)
+
+                - script: |
+                    cat > backend.tf <<EOF
+                    terraform {
+                      backend "azurerm" {
+                        storage_account_name = "$(TF_STATE_STORAGE_ACCOUNT)"
+                        container_name       = "tfstate"
+                        key                  = "dev.terraform.tfstate"
+                        resource_group_name  = "$(TF_STATE_RESOURCE_GROUP)"
+                        use_azuread_auth     = true
+                      }
+                    }
+                    EOF
+                  displayName: 'Setup Backend Config'
+                  workingDirectory: terraform/environments/dev
+
+                - script: terraform init
+                  displayName: 'Terraform Init'
+                  workingDirectory: terraform/environments/dev
+
+                - script: terraform apply -auto-approve -input=false
+                  displayName: 'Terraform Apply'
+                  workingDirectory: terraform/environments/dev
+
+                - script: terraform output -json
+                  displayName: 'Terraform Output'
+                  workingDirectory: terraform/environments/dev
+
